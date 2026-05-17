@@ -1043,8 +1043,12 @@ async def ensure_last_n_epochs(store, current_block, n=ANALYSIS_EPOCH_COUNT):
     target_epochs = [en for en in range(last_done, max(0, last_done - n), -1) if en >= 1]
     missing       = [en for en in target_epochs if en not in existing]
 
+    # Always heal pending records first — even if no new epochs to fetch.
+    # This fills resets that were stored as "pending" before the next epoch was cached.
+    healed = await heal_pending_records(store, None)   # sha=None → save handled by caller
+
     if not missing:
-        return False
+        return healed   # may have changed via healing even if nothing new to fetch
 
     # Build a cache of block-height → (ts, tss, hash) so shared boundary blocks
     # (reset of epoch N == start of epoch N+1) are only fetched once.
@@ -1418,7 +1422,11 @@ async def handle(update: Update):
         async def analysis_job():
             s, sh = await load_data_async()
             snap  = await get_live_block_snapshot()
-            if await ensure_last_n_epochs(s, snap["currentHeight"]):
+            changed = await ensure_last_n_epochs(s, snap["currentHeight"])
+            # ensure_last_n_epochs already heals pending records internally,
+            # but heal again with sha so any changes get saved to GitHub.
+            healed = await heal_pending_records(s, sh)
+            if changed or healed:
                 await save_data_async(s, sh)
             return s, snap
 
@@ -1482,12 +1490,10 @@ async def handle(update: Update):
             s, sh    = await load_data_async()
             results  = []
             changed  = False
+
+            # First: fetch any missing records
             for epoch_no in epoch_nos:
                 rec = find_history_record(s, epoch_no)
-                if rec and not rec.get("reset_timestamp"):
-                    next_rec = find_history_record(s, epoch_no + 1)
-                    if _fill_reset_from_next(rec, next_rec):
-                        changed = True
                 if rec is None:
                     next_rec       = find_history_record(s, epoch_no + 1)
                     prefetch_reset = None
@@ -1501,10 +1507,18 @@ async def handle(update: Update):
                     if rec:
                         s["history"].append(rec)
                         changed = True
-                results.append((epoch_no, rec))
-            if changed:
+
+            # Then: heal ALL pending records (including newly added ones)
+            # This means /epoch 212,213 will fill 212's reset from 213's
+            # start in a single call, without needing a separate /epoch 212.
+            healed = await heal_pending_records(s, None)
+            if changed or healed:
                 s["history"].sort(key=lambda x: normalize_uint(x.get("epoch_no")))
                 await save_data_async(s, sh)
+
+            # Build results after healing so reports show filled data
+            for epoch_no in epoch_nos:
+                results.append((epoch_no, find_history_record(s, epoch_no)))
             return results
 
         label = f"Epoch {epoch_nos[0]}" if len(epoch_nos) == 1 else f"{len(epoch_nos)} epochs"
